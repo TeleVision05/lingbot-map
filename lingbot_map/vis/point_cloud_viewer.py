@@ -1195,11 +1195,17 @@ class PointCloudViewer:
             gui_framerate.value = int(gui_framerate_options.value)
 
         prev_timestep = self.gui_timestep.value
+        self.frame_nodes = []
 
         @self.gui_timestep.on_update
         def _(_) -> None:
             nonlocal prev_timestep
+            # Guard: viser may fire this before frames are created below.
+            if not self.frame_nodes:
+                return
             current_timestep = self.gui_timestep.value
+            if current_timestep >= len(self.frame_nodes) or prev_timestep >= len(self.frame_nodes):
+                return
 
             if self.current_frame_image is not None and hasattr(self, 'original_images'):
                 if current_timestep < len(self.original_images):
@@ -1213,7 +1219,6 @@ class PointCloudViewer:
             prev_timestep = current_timestep
 
         self.server.scene.add_frame("/frames", show_axes=False)
-        self.frame_nodes = []
         for i in range(self.num_frames):
             step = self.all_steps[i]
             self.frame_nodes.append(
@@ -1225,6 +1230,8 @@ class PointCloudViewer:
                 if i % downsample_factor == 0:
                     self.add_camera(step)
 
+        print(f"Viewer scene ready: {self.num_frames} frames, "
+              f"show_camera={self.show_camera}")
         prev_timestep = self.gui_timestep.value
         while True:
             if self.on_replay:

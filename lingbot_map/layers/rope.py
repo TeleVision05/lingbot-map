@@ -326,8 +326,9 @@ class WanRotaryPosEmbed(nn.Module):
         for dim in [t_dim, h_dim, w_dim]:
             # 每个维度独立调用1D RoPE
             # 返回复数形式的频率: [max_seq_len, dim//2]
+            # float32: MPS has no float64; CUDA/CPU float32 is accurate enough for inference.
             freq = get_1d_rotary_pos_embed(
-                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float64
+                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float32
             )
             freqs.append(freq)
         # 将三个维度的频率在最后一维拼接: [max_seq_len, (t_dim + h_dim + w_dim)//2]

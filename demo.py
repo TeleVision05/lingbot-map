@@ -49,6 +49,37 @@ from lingbot_map.utils.geometry import closed_form_inverse_se3_general
 from lingbot_map.utils.load_fn import load_and_preprocess_images
 
 
+def select_device():
+    """Prefer CUDA, then Apple MPS, else CPU.
+
+    Override with LINGBOT_DEVICE=cpu|mps|cuda when needed (MPS can be unstable).
+    """
+    forced = os.environ.get("LINGBOT_DEVICE", "").strip().lower()
+    if forced in ("cpu", "mps", "cuda"):
+        if forced == "cuda" and not torch.cuda.is_available():
+            print("LINGBOT_DEVICE=cuda requested but CUDA unavailable; using CPU")
+            return torch.device("cpu")
+        if forced == "mps" and not (
+            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        ):
+            print("LINGBOT_DEVICE=mps requested but MPS unavailable; using CPU")
+            return torch.device("cpu")
+        return torch.device(forced)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def amp_autocast(device, dtype):
+    """Autocast for the active device; disabled on plain CPU/MPS (fp32)."""
+    if device.type == "cuda":
+        return torch.amp.autocast("cuda", dtype=dtype)
+    # MPS autocast float16 is unstable for this model; run full fp32.
+    return torch.amp.autocast("cpu", enabled=False)
+
+
 # =============================================================================
 # Image loading
 # =============================================================================
@@ -151,7 +182,9 @@ def load_model(args, device):
 
     if args.model_path:
         print(f"Loading checkpoint: {args.model_path}")
-        ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
+        # Load on CPU first — direct MPS map_location can leave weights in a
+        # bad state on some PyTorch builds.
+        ckpt = torch.load(args.model_path, map_location="cpu", weights_only=False)
         state_dict = ckpt.get("model", ckpt)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -216,10 +249,12 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype,
     warm_scale = images[:scale_frames].unsqueeze(0).to(dtype)
     warm_stream = images[scale_frames:scale_frames + warm_stream_n].unsqueeze(0).to(dtype)
 
+    device = images.device
     for _ in range(passes):
         model.clean_kv_cache()
-        torch.compiler.cudagraph_mark_step_begin()
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+        if device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
+        with torch.no_grad(), amp_autocast(device, dtype):
             model.forward(
                 warm_scale,
                 num_frame_for_scale=scale_frames,
@@ -230,8 +265,9 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype,
             is_keyframe = (kf_int <= 1) or (i % kf_int == 0)
             if not is_keyframe:
                 model._set_skip_append(True)
-            torch.compiler.cudagraph_mark_step_begin()
-            with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+            if device.type == "cuda":
+                torch.compiler.cudagraph_mark_step_begin()
+            with torch.no_grad(), amp_autocast(device, dtype):
                 model.forward(
                     warm_stream[:, i:i + 1],
                     num_frame_for_scale=scale_frames,
@@ -242,6 +278,8 @@ def _warm_streaming(model, images, scale_frames, warm_stream_n, dtype,
                 model._set_skip_append(False)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
     # Wipe warmup KV so real inference_streaming starts clean (it also calls
     # clean_kv_cache internally, but this is defensive + makes intent obvious).
     model.clean_kv_cache()
@@ -418,7 +456,12 @@ def main():
     assert args.image_folder or args.video_path, \
         "Provide --image_folder or --video_path"
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_device()
+    print(f"Using device: {device}")
+    # FlashInfer is CUDA-only; force SDPA on MPS/CPU.
+    if device.type != "cuda" and not args.use_sdpa:
+        print("Non-CUDA device detected — enabling --use_sdpa")
+        args.use_sdpa = True
 
     # ── Load images & model ──────────────────────────────────────────────────
     t0 = time.time()
@@ -447,6 +490,9 @@ def main():
     # Pick inference dtype; autocast still runs for the ops that need fp32 (e.g. LayerNorm).
     if torch.cuda.is_available():
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    elif device.type == "mps":
+        # float16 on MPS frequently produces NaN poses/points for this model.
+        dtype = torch.float32
     else:
         dtype = torch.float32
 
@@ -542,7 +588,7 @@ def main():
 
     output_device = torch.device("cpu") if args.offload_to_cpu else None
 
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+    with torch.no_grad(), amp_autocast(device, dtype):
         if args.mode == "streaming":
             predictions = model.inference_streaming(
                 images,
@@ -580,6 +626,32 @@ def main():
 
     predictions, images_cpu = postprocess(predictions, images_for_post)
 
+    # Diagnostics + sanitize — MPS (and bad windows) can emit NaN/Inf poses/points,
+    # which explode camera frustums into giant colored planes in the viewer.
+    def _finite_stats(name, t):
+        if not isinstance(t, torch.Tensor):
+            return
+        n_nan = int(torch.isnan(t).sum())
+        n_inf = int(torch.isinf(t).sum())
+        print(f"  {name}: shape={tuple(t.shape)} nan={n_nan} inf={n_inf}")
+        if n_nan or n_inf:
+            t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+            predictions[name] = t
+        return t
+
+    print("Prediction health:")
+    for key in ("extrinsic", "intrinsic", "world_points", "world_points_conf", "depth", "depth_conf"):
+        if key in predictions:
+            _finite_stats(key, predictions[key])
+
+    show_camera = True
+    if "extrinsic" in predictions and isinstance(predictions["extrinsic"], torch.Tensor):
+        ext = predictions["extrinsic"]
+        if torch.isnan(ext).any() or torch.isinf(ext).any() or (ext.abs() > 1e6).any():
+            print("WARNING: camera poses look invalid — hiding camera frustums in viewer")
+            show_camera = False
+            predictions["extrinsic"] = torch.nan_to_num(ext, nan=0.0, posinf=0.0, neginf=0.0)
+
     # ── Visualize ────────────────────────────────────────────────────────────
     try:
         from lingbot_map.vis import PointCloudViewer
@@ -593,8 +665,11 @@ def main():
             image_folder=resolved_image_folder,
             sky_mask_dir=args.sky_mask_dir,
             sky_mask_visualization_dir=args.sky_mask_visualization_dir,
+            show_camera=show_camera,
         )
         print(f"3D viewer at http://localhost:{args.port}")
+        if not show_camera:
+            print("Tip: enable 'Show Camera' in the GUI once poses look sane.")
         viewer.run()
     except ImportError:
         print("viser not installed. Install with: pip install lingbot-map[vis]")
