@@ -13,6 +13,9 @@ CLAUDE.md
 skyseg.onnx
 .claude-remote
 weights/
+checkpoints/
+.venv/
+venv/
 .DS_Store
 **/.DS_Store
 docs/
